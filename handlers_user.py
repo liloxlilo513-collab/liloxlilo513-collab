@@ -12,7 +12,7 @@ from config import POINTS_PER_GMAIL, SUPPORT_USERNAME, ADMIN_IDS
 from lang import t
 import database as db
 
-# ── Conversation states ───────────────────────────────────────
+# ── Conversation states (user + admin in one handler) ─────────
 (
     CHOOSE_LANG,
     MAIN_MENU,
@@ -21,14 +21,54 @@ import database as db
     GMAIL_EMAIL,
     GMAIL_PASS,
     WITHDRAW_CONFIRM,
-) = range(7)
+    ADMIN_MENU,
+    ADM_CREDIT_ID,
+    ADM_CREDIT_AMT,
+    ADM_BAN,
+    ADM_UNBAN,
+    ADM_BROADCAST,
+) = range(13)
 
 GMAIL_REGEX = re.compile(r"^[a-zA-Z0-9._%+-]+@gmail\.com$", re.IGNORECASE)
 
 
 # ══════════════════════════════════════════════════════════════
-#  Helpers
+#  Helpers – single-message editing  (no more stacking!)
 # ══════════════════════════════════════════════════════════════
+
+async def _edit_or_send(update, context, text, reply_markup=None):
+    """Edit the tracked bot message. Falls back to sending a new one."""
+    chat_id = update.effective_chat.id
+    msg_id = context.user_data.get("bot_msg_id")
+    try:
+        if msg_id:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+            )
+            return
+    except Exception:
+        pass
+    # Fallback: send new message and track it
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode="HTML",
+        reply_markup=reply_markup,
+    )
+    context.user_data["bot_msg_id"] = msg.message_id
+
+
+async def _delete_user_msg(update):
+    """Silently delete the user's typed message to keep the chat clean."""
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
 
 async def get_lang(user_id: int) -> str:
     user = await db.get_user(user_id)
@@ -70,40 +110,52 @@ def back_keyboard(lang: str):
 
 
 # ══════════════════════════════════════════════════════════════
-#  /start
+#  /start — entry point
 # ══════════════════════════════════════════════════════════════
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    # Delete the /start command to keep chat clean
+    await _delete_user_msg(update)
+
     db_user = await db.get_user(user.id)
 
     if not db_user:
-        # First time — show welcome & language picker
+        # New user → language picker
         kb = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("🇬🇧 English", callback_data="lang_en"),
                 InlineKeyboardButton("🇸🇦 العربية", callback_data="lang_ar"),
             ]
         ])
-        await update.message.reply_text(
-            t("welcome", "en"),
+        msg = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=t("welcome", "en"),
             parse_mode="HTML",
             reply_markup=kb,
         )
+        context.user_data["bot_msg_id"] = msg.message_id
         return CHOOSE_LANG
 
     if db_user.get("is_banned"):
         lang = db_user["lang"]
-        await update.message.reply_text(t("banned", lang), parse_mode="HTML")
+        msg = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=t("banned", lang),
+            parse_mode="HTML",
+        )
+        context.user_data["bot_msg_id"] = msg.message_id
         return ConversationHandler.END
 
     lang = db_user["lang"]
     is_admin = user.id in ADMIN_IDS
-    await update.message.reply_text(
-        t("main_menu", lang),
+    msg = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=t("main_menu", lang),
         parse_mode="HTML",
         reply_markup=main_menu_keyboard(lang, is_admin),
     )
+    context.user_data["bot_msg_id"] = msg.message_id
     return MAIN_MENU
 
 
@@ -180,11 +232,12 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /cancel typed manually during conversation."""
+    await _delete_user_msg(update)
     lang = await get_lang(update.effective_user.id)
     is_admin = update.effective_user.id in ADMIN_IDS
-    await update.message.reply_text(
+    await _edit_or_send(
+        update, context,
         t("cancelled", lang) + "\n\n" + t("main_menu", lang),
-        parse_mode="HTML",
         reply_markup=main_menu_keyboard(lang, is_admin),
     )
     return MAIN_MENU
@@ -207,34 +260,30 @@ async def set_lovable_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def lovable_email_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = await get_lang(update.effective_user.id)
     email = update.message.text.strip()
+    await _delete_user_msg(update)
+    lang = await get_lang(update.effective_user.id)
     context.user_data["lovable_email"] = email
-    await update.message.reply_text(
+    await _edit_or_send(
+        update, context,
         t("lovable_prompt_password", lang),
-        parse_mode="HTML",
         reply_markup=cancel_keyboard(lang),
     )
     return LOVABLE_PASS
 
 
 async def lovable_pass_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = await get_lang(update.effective_user.id)
     password = update.message.text.strip()
+    await _delete_user_msg(update)
+    lang = await get_lang(update.effective_user.id)
     email = context.user_data.get("lovable_email", "")
 
     await db.set_lovable_account(update.effective_user.id, email, password)
 
-    # Delete the password message for security
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-
     is_admin = update.effective_user.id in ADMIN_IDS
-    await update.message.reply_text(
+    await _edit_or_send(
+        update, context,
         t("lovable_saved", lang) + "\n\n" + t("main_menu", lang),
-        parse_mode="HTML",
         reply_markup=main_menu_keyboard(lang, is_admin),
     )
     return MAIN_MENU
@@ -250,7 +299,7 @@ async def submit_gmail_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = update.effective_user
     lang = await get_lang(user.id)
 
-    # Check if lovable account is set
+    # Must have Lovable account set first
     db_user = await db.get_user(user.id)
     if not db_user.get("lovable_email"):
         await query.edit_message_text(
@@ -269,58 +318,54 @@ async def submit_gmail_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def gmail_email_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = await get_lang(update.effective_user.id)
     email = update.message.text.strip().lower()
+    await _delete_user_msg(update)
+    lang = await get_lang(update.effective_user.id)
 
     if not GMAIL_REGEX.match(email):
-        await update.message.reply_text(
+        await _edit_or_send(
+            update, context,
             t("gmail_invalid", lang),
-            parse_mode="HTML",
             reply_markup=cancel_keyboard(lang),
         )
         return GMAIL_EMAIL
 
     if await db.gmail_exists(email):
-        await update.message.reply_text(
+        await _edit_or_send(
+            update, context,
             t("gmail_duplicate", lang),
-            parse_mode="HTML",
             reply_markup=cancel_keyboard(lang),
         )
         return GMAIL_EMAIL
 
     context.user_data["gmail_email"] = email
-    await update.message.reply_text(
+    await _edit_or_send(
+        update, context,
         t("gmail_prompt_password", lang),
-        parse_mode="HTML",
         reply_markup=cancel_keyboard(lang),
     )
     return GMAIL_PASS
 
 
 async def gmail_pass_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    password = update.message.text.strip()
+    email_for_submit = context.user_data.get("gmail_email", "")
+    await _delete_user_msg(update)
+
     user = update.effective_user
     lang = await get_lang(user.id)
-    password = update.message.text.strip()
-    email = context.user_data.get("gmail_email", "")
 
-    # Save gmail
-    await db.add_gmail(user.id, email, password, POINTS_PER_GMAIL)
+    await db.add_gmail(user.id, email_for_submit, password, POINTS_PER_GMAIL)
     await db.add_points(user.id, POINTS_PER_GMAIL)
 
-    # Delete password message for security
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-
     db_user = await db.get_user(user.id)
-    balance = db_user["balance"]
+    balance_val = db_user["balance"]
     is_admin = user.id in ADMIN_IDS
 
-    await update.message.reply_text(
-        t("gmail_success", lang, email=email, points=POINTS_PER_GMAIL, balance=balance)
+    await _edit_or_send(
+        update, context,
+        t("gmail_success", lang, email=email_for_submit, points=POINTS_PER_GMAIL, balance=balance_val)
         + "\n\n" + t("main_menu", lang),
-        parse_mode="HTML",
         reply_markup=main_menu_keyboard(lang, is_admin),
     )
     return MAIN_MENU
@@ -447,7 +492,7 @@ async def withdraw_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE)
     w_id = await db.create_withdrawal(user.id, points)
     await db.deduct_points(user.id, points)
 
-    # Notify admins
+    # Notify admins (separate notification messages)
     for admin_id in ADMIN_IDS:
         try:
             admin_text = (
@@ -478,26 +523,18 @@ async def withdraw_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ══════════════════════════════════════════════════════════════
-#  Support
-# ══════════════════════════════════════════════════════════════
-
-async def support_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    lang = await get_lang(update.effective_user.id)
-    await query.edit_message_text(
-        t("support_msg", lang, support=SUPPORT_USERNAME),
-        parse_mode="HTML",
-        reply_markup=back_keyboard(lang),
-    )
-    return MAIN_MENU
-
-
-# ══════════════════════════════════════════════════════════════
-#  Build the ConversationHandler
+#  Build the ConversationHandler  (user + admin flows)
 # ══════════════════════════════════════════════════════════════
 
 def build_user_conversation() -> ConversationHandler:
+    # Late import to avoid circular dependency
+    from handlers_admin import (
+        admin_panel, view_gmails, view_users, view_withdrawals,
+        add_credit_start, add_credit_id_received, add_credit_amount_received,
+        broadcast_start, broadcast_msg_received,
+        ban_start, unban_start, ban_id_received, unban_id_received,
+    )
+
     return ConversationHandler(
         entry_points=[CommandHandler("start", start_command)],
         states={
@@ -513,6 +550,7 @@ def build_user_conversation() -> ConversationHandler:
                 CallbackQueryHandler(set_lovable_start, pattern=r"^set_lovable$"),
                 CallbackQueryHandler(withdraw_start, pattern=r"^withdraw$"),
                 CallbackQueryHandler(change_lang_callback, pattern=r"^change_lang$"),
+                CallbackQueryHandler(admin_panel, pattern=r"^admin_panel$"),
                 CallbackQueryHandler(back_to_main, pattern=r"^back_main$"),
             ],
             LOVABLE_EMAIL: [
@@ -534,6 +572,38 @@ def build_user_conversation() -> ConversationHandler:
             WITHDRAW_CONFIRM: [
                 CallbackQueryHandler(withdraw_confirmed, pattern=r"^withdraw_yes$"),
                 CallbackQueryHandler(back_to_main, pattern=r"^back_main$"),
+            ],
+            # ── Admin states ──────────────────────────────────
+            ADMIN_MENU: [
+                CallbackQueryHandler(view_gmails, pattern=r"^adm_gmails$"),
+                CallbackQueryHandler(view_users, pattern=r"^adm_users$"),
+                CallbackQueryHandler(view_withdrawals, pattern=r"^adm_withdrawals$"),
+                CallbackQueryHandler(add_credit_start, pattern=r"^adm_add_credit$"),
+                CallbackQueryHandler(broadcast_start, pattern=r"^adm_broadcast$"),
+                CallbackQueryHandler(ban_start, pattern=r"^adm_ban$"),
+                CallbackQueryHandler(unban_start, pattern=r"^adm_unban$"),
+                CallbackQueryHandler(admin_panel, pattern=r"^admin_panel$"),
+                CallbackQueryHandler(back_to_main, pattern=r"^back_main$"),
+            ],
+            ADM_CREDIT_ID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_credit_id_received),
+                CallbackQueryHandler(admin_panel, pattern=r"^admin_panel$"),
+            ],
+            ADM_CREDIT_AMT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_credit_amount_received),
+                CallbackQueryHandler(admin_panel, pattern=r"^admin_panel$"),
+            ],
+            ADM_BAN: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ban_id_received),
+                CallbackQueryHandler(admin_panel, pattern=r"^admin_panel$"),
+            ],
+            ADM_UNBAN: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, unban_id_received),
+                CallbackQueryHandler(admin_panel, pattern=r"^admin_panel$"),
+            ],
+            ADM_BROADCAST: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_msg_received),
+                CallbackQueryHandler(admin_panel, pattern=r"^admin_panel$"),
             ],
         },
         fallbacks=[

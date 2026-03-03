@@ -26,10 +26,10 @@ async def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Register user conversation (handles /start and all user flows)
+    # Single ConversationHandler for ALL user + admin flows
     app.add_handler(build_user_conversation())
 
-    # Register admin handlers (panels, add credit, broadcast, ban, etc.)
+    # Withdrawal approve/reject (works on admin notification messages)
     register_admin_handlers(app)
 
     logger.info("🤖  Bot is starting...")

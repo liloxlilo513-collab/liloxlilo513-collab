@@ -1,8 +1,15 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ContextTypes, CallbackQueryHandler, MessageHandler, filters
+from telegram.ext import ContextTypes, CallbackQueryHandler
 from config import ADMIN_IDS
 from lang import t
 import database as db
+
+# Import states and helpers from handlers_user
+from handlers_user import (
+    MAIN_MENU, ADMIN_MENU, ADM_CREDIT_ID, ADM_CREDIT_AMT,
+    ADM_BAN, ADM_UNBAN, ADM_BROADCAST,
+    _edit_or_send, _delete_user_msg, main_menu_keyboard,
+)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -15,7 +22,7 @@ def admin_only(func):
         if user_id not in ADMIN_IDS:
             if update.callback_query:
                 await update.callback_query.answer(t("not_admin", "en"), show_alert=True)
-            return
+            return  # None → ConversationHandler stays in current state
         return await func(update, context)
     return wrapper
 
@@ -46,6 +53,13 @@ def admin_menu_keyboard(lang: str):
     ])
 
 
+def admin_back_keyboard(lang: str):
+    """Back button that returns to admin panel."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(t("btn_back", lang), callback_data="admin_panel")]
+    ])
+
+
 # ══════════════════════════════════════════════════════════════
 #  Admin Panel
 # ══════════════════════════════════════════════════════════════
@@ -62,6 +76,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = t("admin_panel", lang, users=user_count, gmails=gmail_count, pending=len(pending))
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=admin_menu_keyboard(lang))
+    return ADMIN_MENU
 
 
 # ══════════════════════════════════════════════════════════════
@@ -87,10 +102,8 @@ async def view_gmails(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"   👤 <code>{g['telegram_id']}</code> • {date}\n\n"
             )
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(t("btn_back", lang), callback_data="admin_panel")]
-    ])
-    await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=admin_back_keyboard(lang))
+    return ADMIN_MENU
 
 
 # ══════════════════════════════════════════════════════════════
@@ -118,10 +131,8 @@ async def view_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"   {lovable}\n\n"
             )
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(t("btn_back", lang), callback_data="admin_panel")]
-    ])
-    await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=admin_back_keyboard(lang))
+    return ADMIN_MENU
 
 
 # ══════════════════════════════════════════════════════════════
@@ -137,11 +148,8 @@ async def view_withdrawals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending = await db.get_pending_withdrawals()
     if not pending:
         text = "🎁 <b>No pending withdrawal requests.</b>"
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(t("btn_back", lang), callback_data="admin_panel")]
-        ])
-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
-        return
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=admin_back_keyboard(lang))
+        return ADMIN_MENU
 
     text = f"🎁 <b>Pending Withdrawals</b> ({len(pending)}):\n\n"
     for w in pending:
@@ -155,21 +163,20 @@ async def view_withdrawals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🆔 WID: <code>{w['id']}</code>\n\n"
         )
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(t("btn_back", lang), callback_data="admin_panel")]
-    ])
-    await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=admin_back_keyboard(lang))
+    return ADMIN_MENU
 
 
 # ══════════════════════════════════════════════════════════════
-#  Approve / Reject withdrawal (inline from notification)
+#  Approve / Reject withdrawal  (inline from notification msgs)
 # ══════════════════════════════════════════════════════════════
 
 @admin_only
 async def withdrawal_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles w_approve_<id> and w_reject_<id> from admin notification messages."""
     query = update.callback_query
     await query.answer()
-    data = query.data  # w_approve_<id> or w_reject_<id>
+    data = query.data
 
     parts = data.split("_", 2)
     action = parts[1]       # approve / reject
@@ -193,9 +200,7 @@ async def withdrawal_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lovable_email = user.get("lovable_email", "N/A") if user else "N/A"
 
     if status == "rejected":
-        # Refund points back to user balance
         await db.refund_points(w["telegram_id"], w["points"])
-        # Beautiful rejection notification
         try:
             await context.bot.send_message(
                 w["telegram_id"],
@@ -206,7 +211,6 @@ async def withdrawal_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     if status == "approved":
-        # Beautiful approval notification
         try:
             await context.bot.send_message(
                 w["telegram_id"],
@@ -218,7 +222,7 @@ async def withdrawal_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════════
-#  Add Credit to User (Admin manually adds Lovable credits)
+#  Add Credit
 # ══════════════════════════════════════════════════════════════
 
 @admin_only
@@ -226,98 +230,111 @@ async def add_credit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     lang = await get_admin_lang(update.effective_user.id)
-    context.user_data["admin_action"] = "add_credit_id"
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(t("btn_cancel", lang), callback_data="admin_panel")]
-    ])
     await query.edit_message_text(
         t("add_credit_prompt_id", lang),
         parse_mode="HTML",
-        reply_markup=kb,
+        reply_markup=admin_back_keyboard(lang),
     )
+    return ADM_CREDIT_ID
 
 
-async def add_credit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle the multi-step add credit flow for admin."""
-    action = context.user_data.get("admin_action")
-    if action not in ("add_credit_id", "add_credit_amount"):
-        return
+async def add_credit_id_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 1: receive target user's Telegram ID."""
     if update.effective_user.id not in ADMIN_IDS:
-        return
-
+        return ADMIN_MENU
+    text_input = update.message.text.strip()
+    await _delete_user_msg(update)
     lang = await get_admin_lang(update.effective_user.id)
 
-    if action == "add_credit_id":
-        # Step 1: receive telegram ID
-        try:
-            target_id = int(update.message.text.strip())
-        except ValueError:
-            await update.message.reply_text("❌ Invalid ID. Send a numeric Telegram ID.")
-            return
-
-        target_user = await db.get_user(target_id)
-        if not target_user:
-            await update.message.reply_text(t("user_not_found", lang), parse_mode="HTML")
-            return
-
-        context.user_data["add_credit_target"] = target_id
-        context.user_data["admin_action"] = "add_credit_amount"
-
-        lovable = target_user.get("lovable_email", "Not set")
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(t("btn_cancel", lang), callback_data="admin_panel")]
-        ])
-        await update.message.reply_text(
-            t("add_credit_prompt_amount", lang,
-              name=target_user["full_name"],
-              tid=target_id,
-              lovable=lovable),
-            parse_mode="HTML",
-            reply_markup=kb,
+    try:
+        target_id = int(text_input)
+    except ValueError:
+        await _edit_or_send(
+            update, context,
+            "❌ Invalid ID. Send a numeric Telegram ID.",
+            reply_markup=admin_back_keyboard(lang),
         )
+        return ADM_CREDIT_ID
 
-    elif action == "add_credit_amount":
-        # Step 2: receive credit amount
-        try:
-            amount = int(update.message.text.strip())
-            if amount <= 0:
-                raise ValueError
-        except ValueError:
-            await update.message.reply_text(t("add_credit_invalid_amount", lang), parse_mode="HTML")
-            return
-
-        target_id = context.user_data.get("add_credit_target")
-        context.user_data.pop("admin_action", None)
-        context.user_data.pop("add_credit_target", None)
-
-        target_user = await db.get_user(target_id)
-        if not target_user:
-            await update.message.reply_text(t("user_not_found", lang), parse_mode="HTML")
-            return
-
-        # Record the credit addition in DB
-        await db.add_admin_credit(target_id, amount, update.effective_user.id)
-
-        user_lang = target_user.get("lang", "en")
-        lovable_email = target_user.get("lovable_email", "N/A")
-
-        # Send beautiful notification to user
-        try:
-            await context.bot.send_message(
-                target_id,
-                t("notify_credit_added", user_lang, amount=amount, lovable=lovable_email),
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-
-        # Confirm to admin
-        from handlers_user import main_menu_keyboard
-        await update.message.reply_text(
-            t("add_credit_done", lang, amount=amount, name=target_user["full_name"]),
-            parse_mode="HTML",
-            reply_markup=main_menu_keyboard(lang, True),
+    target_user = await db.get_user(target_id)
+    if not target_user:
+        await _edit_or_send(
+            update, context,
+            t("user_not_found", lang),
+            reply_markup=admin_back_keyboard(lang),
         )
+        return ADM_CREDIT_ID
+
+    context.user_data["add_credit_target"] = target_id
+    lovable = target_user.get("lovable_email", "Not set")
+    await _edit_or_send(
+        update, context,
+        t("add_credit_prompt_amount", lang,
+          name=target_user["full_name"],
+          tid=target_id,
+          lovable=lovable),
+        reply_markup=admin_back_keyboard(lang),
+    )
+    return ADM_CREDIT_AMT
+
+
+async def add_credit_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 2: receive credit amount and process."""
+    if update.effective_user.id not in ADMIN_IDS:
+        return ADMIN_MENU
+    text_input = update.message.text.strip()
+    await _delete_user_msg(update)
+    lang = await get_admin_lang(update.effective_user.id)
+
+    try:
+        amount = int(text_input)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await _edit_or_send(
+            update, context,
+            t("add_credit_invalid_amount", lang),
+            reply_markup=admin_back_keyboard(lang),
+        )
+        return ADM_CREDIT_AMT
+
+    target_id = context.user_data.get("add_credit_target")
+    target_user = await db.get_user(target_id)
+    if not target_user:
+        await _edit_or_send(
+            update, context,
+            t("user_not_found", lang),
+            reply_markup=admin_back_keyboard(lang),
+        )
+        return ADMIN_MENU
+
+    # Record credit
+    await db.add_admin_credit(target_id, amount, update.effective_user.id)
+
+    # Notify user
+    user_lang = target_user.get("lang", "en")
+    lovable_email = target_user.get("lovable_email", "N/A")
+    try:
+        await context.bot.send_message(
+            target_id,
+            t("notify_credit_added", user_lang, amount=amount, lovable=lovable_email),
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+    # Show confirmation + admin panel
+    user_count = await db.get_user_count()
+    gmail_count = await db.get_gmail_count()
+    pending = await db.get_pending_withdrawals()
+
+    text = (
+        t("add_credit_done", lang, amount=amount, name=target_user["full_name"])
+        + "\n\n"
+        + t("admin_panel", lang, users=user_count, gmails=gmail_count, pending=len(pending))
+    )
+    await _edit_or_send(update, context, text, reply_markup=admin_menu_keyboard(lang))
+    return ADMIN_MENU
 
 
 # ══════════════════════════════════════════════════════════════
@@ -329,36 +346,43 @@ async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     lang = await get_admin_lang(update.effective_user.id)
-    context.user_data["admin_action"] = "broadcast"
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(t("btn_cancel", lang), callback_data="admin_panel")]
-    ])
-    await query.edit_message_text(t("broadcast_prompt", lang), parse_mode="HTML", reply_markup=kb)
+    await query.edit_message_text(
+        t("broadcast_prompt", lang),
+        parse_mode="HTML",
+        reply_markup=admin_back_keyboard(lang),
+    )
+    return ADM_BROADCAST
 
 
-@admin_only
-async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("admin_action") != "broadcast":
-        return
-    context.user_data.pop("admin_action", None)
+async def broadcast_msg_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive broadcast message and send to all users."""
+    if update.effective_user.id not in ADMIN_IDS:
+        return ADMIN_MENU
+    msg_text = update.message.text
+    await _delete_user_msg(update)
     lang = await get_admin_lang(update.effective_user.id)
 
-    msg = update.message.text
     users = await db.get_all_users()
     sent = 0
     for u in users:
         try:
-            await context.bot.send_message(u["telegram_id"], msg, parse_mode="HTML")
+            await context.bot.send_message(u["telegram_id"], msg_text, parse_mode="HTML")
             sent += 1
         except Exception:
             pass
 
-    from handlers_user import main_menu_keyboard
-    await update.message.reply_text(
-        t("broadcast_done", lang, count=sent),
-        parse_mode="HTML",
-        reply_markup=main_menu_keyboard(lang, True),
+    # Show result + admin panel
+    user_count = await db.get_user_count()
+    gmail_count = await db.get_gmail_count()
+    pending = await db.get_pending_withdrawals()
+
+    text = (
+        t("broadcast_done", lang, count=sent)
+        + "\n\n"
+        + t("admin_panel", lang, users=user_count, gmails=gmail_count, pending=len(pending))
     )
+    await _edit_or_send(update, context, text, reply_markup=admin_menu_keyboard(lang))
+    return ADMIN_MENU
 
 
 # ══════════════════════════════════════════════════════════════
@@ -370,11 +394,12 @@ async def ban_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     lang = await get_admin_lang(update.effective_user.id)
-    context.user_data["admin_action"] = "ban"
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(t("btn_cancel", lang), callback_data="admin_panel")]
-    ])
-    await query.edit_message_text(t("ban_prompt", lang), parse_mode="HTML", reply_markup=kb)
+    await query.edit_message_text(
+        t("ban_prompt", lang),
+        parse_mode="HTML",
+        reply_markup=admin_back_keyboard(lang),
+    )
+    return ADM_BAN
 
 
 @admin_only
@@ -382,62 +407,106 @@ async def unban_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     lang = await get_admin_lang(update.effective_user.id)
-    context.user_data["admin_action"] = "unban"
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(t("btn_cancel", lang), callback_data="admin_panel")]
-    ])
-    await query.edit_message_text(t("unban_prompt", lang), parse_mode="HTML", reply_markup=kb)
+    await query.edit_message_text(
+        t("unban_prompt", lang),
+        parse_mode="HTML",
+        reply_markup=admin_back_keyboard(lang),
+    )
+    return ADM_UNBAN
 
 
-async def ban_unban_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle ban/unban text input from admin."""
-    action = context.user_data.get("admin_action")
-    if action not in ("ban", "unban"):
-        return
+async def ban_id_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive user ID and ban them."""
     if update.effective_user.id not in ADMIN_IDS:
-        return
-
-    context.user_data.pop("admin_action", None)
+        return ADMIN_MENU
+    text_input = update.message.text.strip()
+    await _delete_user_msg(update)
     lang = await get_admin_lang(update.effective_user.id)
 
     try:
-        target_id = int(update.message.text.strip())
+        target_id = int(text_input)
     except ValueError:
-        await update.message.reply_text("❌ Invalid ID. Send a numeric Telegram ID.")
-        return
+        await _edit_or_send(
+            update, context,
+            "❌ Invalid ID. Send a numeric Telegram ID.",
+            reply_markup=admin_back_keyboard(lang),
+        )
+        return ADM_BAN
 
     target_user = await db.get_user(target_id)
     if not target_user:
-        await update.message.reply_text(t("user_not_found", lang), parse_mode="HTML")
-        return
+        await _edit_or_send(
+            update, context,
+            t("user_not_found", lang),
+            reply_markup=admin_back_keyboard(lang),
+        )
+        return ADM_BAN
 
-    if action == "ban":
-        await db.ban_user(target_id, True)
-        text = t("ban_done", lang, tid=target_id)
-    else:
-        await db.ban_user(target_id, False)
-        text = t("unban_done", lang, tid=target_id)
+    await db.ban_user(target_id, True)
 
-    from handlers_user import main_menu_keyboard
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=main_menu_keyboard(lang, True))
+    # Show result + admin panel
+    user_count = await db.get_user_count()
+    gmail_count = await db.get_gmail_count()
+    pending = await db.get_pending_withdrawals()
+
+    text = (
+        t("ban_done", lang, tid=target_id)
+        + "\n\n"
+        + t("admin_panel", lang, users=user_count, gmails=gmail_count, pending=len(pending))
+    )
+    await _edit_or_send(update, context, text, reply_markup=admin_menu_keyboard(lang))
+    return ADMIN_MENU
+
+
+async def unban_id_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive user ID and unban them."""
+    if update.effective_user.id not in ADMIN_IDS:
+        return ADMIN_MENU
+    text_input = update.message.text.strip()
+    await _delete_user_msg(update)
+    lang = await get_admin_lang(update.effective_user.id)
+
+    try:
+        target_id = int(text_input)
+    except ValueError:
+        await _edit_or_send(
+            update, context,
+            "❌ Invalid ID. Send a numeric Telegram ID.",
+            reply_markup=admin_back_keyboard(lang),
+        )
+        return ADM_UNBAN
+
+    target_user = await db.get_user(target_id)
+    if not target_user:
+        await _edit_or_send(
+            update, context,
+            t("user_not_found", lang),
+            reply_markup=admin_back_keyboard(lang),
+        )
+        return ADM_UNBAN
+
+    await db.ban_user(target_id, False)
+
+    # Show result + admin panel
+    user_count = await db.get_user_count()
+    gmail_count = await db.get_gmail_count()
+    pending = await db.get_pending_withdrawals()
+
+    text = (
+        t("unban_done", lang, tid=target_id)
+        + "\n\n"
+        + t("admin_panel", lang, users=user_count, gmails=gmail_count, pending=len(pending))
+    )
+    await _edit_or_send(update, context, text, reply_markup=admin_menu_keyboard(lang))
+    return ADMIN_MENU
 
 
 # ══════════════════════════════════════════════════════════════
-#  Register admin handlers
+#  Register withdrawal handler  (outside conversation)
 # ══════════════════════════════════════════════════════════════
 
 def register_admin_handlers(app):
-    """Register all admin callback query handlers."""
-    app.add_handler(CallbackQueryHandler(admin_panel, pattern=r"^admin_panel$"))
-    app.add_handler(CallbackQueryHandler(view_gmails, pattern=r"^adm_gmails$"))
-    app.add_handler(CallbackQueryHandler(view_users, pattern=r"^adm_users$"))
-    app.add_handler(CallbackQueryHandler(view_withdrawals, pattern=r"^adm_withdrawals$"))
-    app.add_handler(CallbackQueryHandler(add_credit_start, pattern=r"^adm_add_credit$"))
-    app.add_handler(CallbackQueryHandler(broadcast_start, pattern=r"^adm_broadcast$"))
-    app.add_handler(CallbackQueryHandler(ban_start, pattern=r"^adm_ban$"))
-    app.add_handler(CallbackQueryHandler(unban_start, pattern=r"^adm_unban$"))
+    """Register the withdrawal approve/reject handler.
+    This runs on admin notification messages, not in the conversation.
+    """
     app.add_handler(CallbackQueryHandler(withdrawal_action, pattern=r"^w_(approve|reject)_"))
-    # Text handlers for admin actions (add credit / broadcast / ban / unban)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, add_credit_handler), group=1)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ban_unban_handler), group=2)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_send), group=3)
