@@ -184,8 +184,7 @@ async def withdrawal_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
     )
 
-    from bson import ObjectId
-    w = await db.withdrawals_col.find_one({"_id": ObjectId(w_id)})
+    w = await db.get_withdrawal_by_id(w_id)
     if not w:
         return
 
@@ -194,11 +193,8 @@ async def withdrawal_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lovable_email = user.get("lovable_email", "N/A") if user else "N/A"
 
     if status == "rejected":
-        # Refund points
-        await db.users_col.update_one(
-            {"telegram_id": w["telegram_id"]},
-            {"$inc": {"balance": w["points"]}},
-        )
+        # Refund points back to user balance
+        await db.refund_points(w["telegram_id"], w["points"])
         # Beautiful rejection notification
         try:
             await context.bot.send_message(
