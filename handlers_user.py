@@ -610,5 +610,6 @@ def build_user_conversation() -> ConversationHandler:
             CommandHandler("cancel", cancel_text),
             CommandHandler("start", start_command),
         ],
+        per_message=False,
         allow_reentry=True,
     )
