@@ -152,7 +152,7 @@ async def view_withdrawals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👤 {name} (<code>{w['telegram_id']}</code>)\n"
             f"💎 {w['points']} pts\n"
             f"🔑 Lovable: <code>{lovable}</code>\n"
-            f"🆔 WID: <code>{w['_id']}</code>\n\n"
+            f"🆔 WID: <code>{w['id']}</code>\n\n"
         )
 
     kb = InlineKeyboardMarkup([
