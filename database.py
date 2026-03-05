@@ -207,7 +207,9 @@ async def get_gmail_count() -> int:
 async def get_all_gmails(limit: int = 50) -> list:
     async with _pool_check().acquire() as conn:
         rows = await conn.fetch(
-            "SELECT * FROM gmails ORDER BY submitted_at DESC LIMIT $1", limit
+            "SELECT g.*, u.username, u.full_name "
+            "FROM gmails g LEFT JOIN users u ON g.telegram_id = u.telegram_id "
+            "ORDER BY g.submitted_at DESC LIMIT $1", limit
         )
         return [dict(r) for r in rows]
 
